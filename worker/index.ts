@@ -43,6 +43,7 @@ const HUB_DELTA_TAG = 'probe-delta'
 // 第 2 版增量帧（/api/stream?delta=2）：没变的字段不发，见 src/probe-delta.ts
 const HUB_DELTA2_TAG = 'probe-delta2'
 const ESTIMATED_TRAFFIC_STORAGE_KEY = 'probe-estimated-daily-traffic-v1'
+const ESTIMATED_TRAFFIC_REPAIR_KEY = 'probe-estimated-traffic-repair-v1'
 const ESTIMATED_TRAFFIC_RETENTION_DAYS = 30
 const ESTIMATED_TRAFFIC_FLUSH_MS = 5 * 60 * 1_000
 const BACKGROUND_POSITIONS = new Set(['center', 'top', 'bottom', 'left', 'right'])
@@ -153,6 +154,98 @@ function needsEstimatedTraffic(server: MutableProbeServer): boolean {
   return split.every((value) => value === null || value === 0)
 }
 
+/**
+ * 估算记录的键。名字唯一时就是名字；多台机器同名时再拼上硬件与到期日指纹，
+ * 否则它们的累计计数器会在同一份记录里来回覆盖，每次快照都把两台的差值当成新流量。
+ * 指纹仍然相同（分不出谁是谁）的返回 null，不做估算。
+ */
+export function estimatedTrafficKeys(servers: MutableProbeServer[]): Array<string | null> {
+  const names = servers.map((server) => server.name?.trim() || '')
+  const nameCount = new Map<string, number>()
+  for (const name of names) if (name) nameCount.set(name, (nameCount.get(name) || 0) + 1)
+  const keys = servers.map((server, index) => {
+    const name = names[index]
+    if (!name) return null
+    if (nameCount.get(name) === 1) return name
+    const expires = typeof server.expires_at === 'string' ? server.expires_at.slice(5, 10) : ''
+    return `${name}\u0000${[server.mem_total, server.disk_total, server.cpu_cores, server.region_country, expires].join('|')}`
+  })
+  const keyCount = new Map<string, number>()
+  for (const key of keys) if (key) keyCount.set(key, (keyCount.get(key) || 0) + 1)
+  return keys.map((key) => (key && keyCount.get(key) === 1 ? key : null))
+}
+
+/**
+ * 名字从唯一变成重复（或反过来）时搬迁旧记录。
+ * 变成重复：按名字存的那份已经混入了别的机器的计数，交给仍需估算的那台，
+ * 丢掉当天和超过整期额度的日流量（都是来回覆盖累加出来的），计数器基线由调用方重置。
+ */
+export function migrateEstimatedTraffic(
+  state: EstimatedTrafficState,
+  servers: MutableProbeServer[],
+  keys: Array<string | null>,
+  today: string,
+): boolean {
+  let changed = false
+  servers.forEach((server, index) => {
+    const name = server.name?.trim()
+    const key = keys[index]
+    if (!name || !key) return
+    if (key === name) {
+      if (state[name]) return
+      const prefix = `${name}\u0000`
+      const old = Object.keys(state).filter((candidate) => candidate.startsWith(prefix))
+      if (old.length === 1) {
+        state[name] = state[old[0]]
+        delete state[old[0]]
+        changed = true
+      }
+      return
+    }
+    const shared = state[name]
+    if (!shared || state[key] || !needsEstimatedTraffic(server)) return
+    const limit = finiteCounter(server.traffic_limit) || 0
+    for (const [date, row] of Object.entries(shared.days)) {
+      if (date === today || (limit > 0 && row.total > limit)) delete shared.days[date]
+    }
+    shared.lastUp = Number.POSITIVE_INFINITY
+    shared.lastDown = Number.POSITIVE_INFINITY
+    state[key] = shared
+    delete state[name]
+    changed = true
+  })
+  for (const name of new Set(servers.map((server) => server.name?.trim() || ''))) {
+    if (!name || !state[name]) continue
+    if (!keys.some((key, index) => key === name && servers[index].name?.trim() === name)) {
+      delete state[name]
+      changed = true
+    }
+  }
+  return changed
+}
+
+/**
+ * 一次性修复：同名机器共用记录期间累加出来的日流量，改名后会留在按名字存的那份里。
+ * 只删明显不可能的日子：单日超过整期额度，且是该机其它日子最大值的 10 倍以上。
+ */
+export function repairEstimatedOutliers(state: EstimatedTrafficState, servers: MutableProbeServer[], keys: Array<string | null>): boolean {
+  let changed = false
+  servers.forEach((server, index) => {
+    const key = keys[index]
+    const estimate = key ? state[key] : undefined
+    const limit = finiteCounter(server.traffic_limit) || 0
+    if (!estimate || limit <= 0) return
+    for (const [date, row] of Object.entries(estimate.days)) {
+      if (row.total <= limit) continue
+      const others = Object.entries(estimate.days).filter(([other]) => other !== date).map(([, other]) => other.total)
+      if (!others.length || row.total < Math.max(...others) * 10) continue
+      delete estimate.days[date]
+      changed = true
+    }
+  })
+  return changed
+}
+
 function pruneEstimatedDays(days: Record<string, EstimatedDailyTrafficRow>, now: number): void {
   const cutoff = new Date(now - (ESTIMATED_TRAFFIC_RETENTION_DAYS - 1) * 86_400_000)
     .toISOString()
@@ -167,6 +260,8 @@ type CloudflareCacheStorage = CacheStorage & { default: Cache }
 function edgeCache(): Cache {
   return (caches as CloudflareCacheStorage).default
 }
+
+const PROVIDER_LOGO_PATH = /^\/api\/provider-logo\/([0-9]{1,10}\.[0-9a-f]{6,64}\.png)$/
 
 const routes: Record<string, string> = {
   '/api/probe': '/api/public/probe-servers',
@@ -377,6 +472,7 @@ export class ProbeHub implements DurableObject {
   private estimatedTraffic: EstimatedTrafficState = {}
   private estimatedTrafficReady: Promise<void>
   private estimatedTrafficDirty = false
+  private estimatedTrafficRepaired = false
   private estimatedTrafficLastFlushAt = 0
 
   constructor(state: DurableObjectState, env: Env) {
@@ -545,8 +641,21 @@ export class ProbeHub implements DurableObject {
     const now = Date.now()
     const today = new Date(now).toISOString().slice(0, 10)
 
-    for (const server of payload.servers) {
-      const name = server.name?.trim()
+    const keys = estimatedTrafficKeys(payload.servers)
+    if (migrateEstimatedTraffic(this.estimatedTraffic, payload.servers, keys, today)) {
+      this.estimatedTrafficDirty = true
+    }
+
+    if (!this.estimatedTrafficRepaired) {
+      this.estimatedTrafficRepaired = true
+      if (!(await this.state.storage.get<boolean>(ESTIMATED_TRAFFIC_REPAIR_KEY))) {
+        if (repairEstimatedOutliers(this.estimatedTraffic, payload.servers, keys)) this.estimatedTrafficDirty = true
+        await this.state.storage.put(ESTIMATED_TRAFFIC_REPAIR_KEY, true)
+      }
+    }
+
+    for (const [index, server] of payload.servers.entries()) {
+      const name = keys[index]
       const currentUp = finiteCounter(server.cumulative_up)
       const currentDown = finiteCounter(server.cumulative_down)
       if (!name || currentUp === null || currentDown === null) continue
@@ -750,6 +859,34 @@ export default {
 
     if (authRoutes.has(incoming.pathname)) {
       return proxyAuth(request, incoming, env)
+    }
+
+    // 服务商 logo（上游 47ae510）：转发主控缓存的图片。公开且不敏感，不带 PROBE_TOKEN；
+    // 文件名带内容哈希（换图即换名），可以长期缓存。只认这种文件名，别的路径不转发。
+    const logo = incoming.pathname.match(PROVIDER_LOGO_PATH)
+    if (logo) {
+      if (request.method !== 'GET' && request.method !== 'HEAD') return new Response('Method not allowed', { status: 405 })
+      if (missingSetupVars(env).length) return new Response('Not found', { status: 404 })
+      // 只把成功的图片放进边缘缓存；失败（主控刚重启、限流）不缓存，隔一会儿再取一次，
+      // 仍失败就让浏览器下次打开页面时重试，不把一次偶发失败记住。
+      const target = originURL(env, `/api/public/provider-logo/${logo[1]}`).toString()
+      const load = () => fetch(new Request(target), {
+        cf: { cacheEverything: true, cacheTtlByStatus: { '200-299': 31_536_000, '300-599': 0 } },
+      } as RequestInit)
+      let upstream = await load()
+      if (!upstream.ok) {
+        await new Promise((resolve) => setTimeout(resolve, 300))
+        upstream = await load()
+      }
+      if (!upstream.ok) return new Response('Not found', { status: 404, headers: { 'Cache-Control': 'no-store' } })
+      return new Response(upstream.body, {
+        status: 200,
+        headers: {
+          'Content-Type': 'image/png',
+          'Cache-Control': 'public, max-age=31536000, immutable',
+          'X-Content-Type-Options': 'nosniff',
+        },
+      })
     }
 
     // 运行时主题配置只包含公开的显示参数，不返回任何 Worker Secret。
